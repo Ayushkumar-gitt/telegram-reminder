@@ -117,7 +117,7 @@ def trigger_call(user, objective, phone, schedule_iso):
     }
 
     headers = {
-        "Authorization": "Bearer bn-0e8607c5312643ffa50f22d80baba8e8",
+        "Authorization": "Bearer ",
         "Content-Type": "application/json"
     }
 
