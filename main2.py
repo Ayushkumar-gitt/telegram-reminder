@@ -6,6 +6,7 @@ import os
 from dotenv import load_dotenv
 import dateparser
 import requests
+from zoneinfo import ZoneInfo   # <--- important for timezone fix
 
 load_dotenv()
 
@@ -47,6 +48,8 @@ def extract_ai_fields(sender_name: str, message: str):
             time_text,
             settings={
                 "PREFER_DATES_FROM": "future",
+                "TIMEZONE": "Asia/Kolkata",
+                "TO_TIMEZONE": "Asia/Kolkata",
                 "RETURN_AS_TIMEZONE_AWARE": False
             }
         )
@@ -86,7 +89,7 @@ def extract_ai_fields(sender_name: str, message: str):
             flags=re.IGNORECASE
         ).strip()
 
-    # fallback like: "for calling mom"
+    # fallback like “for calling mom”
     if not objective:
         fallback = re.search(r"\bfor\s+(.+)", message, re.IGNORECASE)
         if fallback:
@@ -148,7 +151,7 @@ async def start_listening():
 
         extracted = extract_ai_fields(display_name, message_text)
 
-        # URLs: only log, no clipboard
+        # URLs — only log
         urls = re.findall(r'(https?://[^\s]+)', message_text)
         if urls:
             for url in urls:
@@ -167,6 +170,8 @@ async def start_listening():
         scheduled_iso = None
         if dt:
             parsed_dt = datetime.strptime(dt, "%Y-%m-%d %H:%M")
+
+            # Keep -5:30 conversion
             adjusted_dt = parsed_dt - timedelta(hours=5, minutes=30)
             scheduled_iso = adjusted_dt.isoformat()
 
@@ -186,4 +191,4 @@ async def start_listening():
 
     client.loop.create_task(client.run_until_disconnected())
 
-    return {"status": "Listening with tomorrow/today fix — clipboard removed"}
+    return {"status": "Listening (timezone fixed + -5:30 kept)"}
