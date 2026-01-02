@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from telethon import TelegramClient, events
-import pyperclip
 import re
 from datetime import datetime, timedelta
 import os
@@ -87,8 +86,7 @@ def extract_ai_fields(sender_name: str, message: str):
             flags=re.IGNORECASE
         ).strip()
 
-    # fallback for sentences like:
-    # "for calling mom"
+    # fallback like: "for calling mom"
     if not objective:
         fallback = re.search(r"\bfor\s+(.+)", message, re.IGNORECASE)
         if fallback:
@@ -150,11 +148,11 @@ async def start_listening():
 
         extracted = extract_ai_fields(display_name, message_text)
 
+        # URLs: only log, no clipboard
         urls = re.findall(r'(https?://[^\s]+)', message_text)
         if urls:
             for url in urls:
-                pyperclip.copy(url)
-                print(f"[{now}] [{display_name}] Copied URL: {url}")
+                print(f"[{now}] [{display_name}] URL found: {url}")
 
         print("\n--- NEW MESSAGE ---")
         print(f"Display name: {display_name}")
@@ -188,4 +186,4 @@ async def start_listening():
 
     client.loop.create_task(client.run_until_disconnected())
 
-    return {"status": "Listening with tomorrow/today fix"}
+    return {"status": "Listening with tomorrow/today fix — clipboard removed"}
