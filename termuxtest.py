@@ -14,6 +14,8 @@ import sqlite3
 import json
 from typing import Optional, Dict, List, Tuple
 import logging
+import asyncio
+import base64
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -300,8 +302,23 @@ def get_reminder_by_id(reminder_id):
     return row
 
 
+def get_reminder_by_execution_id(execution_id):
+    """Get reminder by execution_id"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, objective, execution_id, scheduled_at, priority,
+               recurrence_pattern, phone, user
+        FROM reminders WHERE execution_id = ?
+    """, (execution_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
 # ================= RECURRENCE =================
 def calculate_next_occurrence(base_datetime: datetime, pattern: str) -> datetime:
+    """Calculate next occurrence based on recurrence pattern"""
     if pattern == "daily":
         return base_datetime + timedelta(days=1)
     elif pattern == "weekly":
@@ -320,6 +337,61 @@ def calculate_next_occurrence(base_datetime: datetime, pattern: str) -> datetime
         return base_datetime.replace(year=base_datetime.year + 1)
     else:
         return None
+
+
+def reschedule_recurring_reminder(execution_id: str):
+    """Reschedule a recurring reminder after it fires"""
+    reminder = get_reminder_by_execution_id(execution_id)
+    if not reminder:
+        logger.warning(f"Reminder with execution_id {execution_id} not found")
+        return
+    
+    rem_id, objective, old_exec_id, scheduled_at, priority, recurrence, phone, user = reminder
+    
+    if not recurrence or recurrence == "once":
+        logger.info(f"Reminder {rem_id} is one-time, not rescheduling")
+        return
+    
+    # Parse current scheduled time
+    current_dt = dateparser.parse(
+        scheduled_at,
+        settings={
+            "TIMEZONE": "Asia/Kolkata",
+            "RETURN_AS_TIMEZONE_AWARE": False
+        }
+    )
+    
+    if not current_dt:
+        logger.error(f"Could not parse scheduled_at: {scheduled_at}")
+        return
+    
+    # Calculate next occurrence
+    next_dt = calculate_next_occurrence(current_dt, recurrence)
+    
+    if not next_dt:
+        logger.error(f"Could not calculate next occurrence for pattern: {recurrence}")
+        return
+    
+    next_str = next_dt.strftime("%Y-%m-%d %H:%M")
+    scheduled_iso = (next_dt - timedelta(hours=5, minutes=30)).isoformat()
+    
+    # Trigger new call
+    result = trigger_call(user, objective, phone, scheduled_iso)
+    new_execution_id = result.get("execution_id")
+    
+    if not new_execution_id:
+        logger.error(f"Failed to schedule next occurrence: {result}")
+        return
+    
+    # Update reminder with new execution_id and scheduled time
+    update_reminder(
+        rem_id,
+        execution_id=new_execution_id,
+        scheduled_at=next_str,
+        last_triggered=datetime.now().isoformat()
+    )
+    
+    logger.info(f"Rescheduled recurring reminder {rem_id} ({recurrence}) to {next_str}")
 
 
 # ================= FUZZY MATCH HELPERS =================
@@ -372,12 +444,25 @@ def find_best_matching_reminder(user_identifier, cancel_text):
 # ================= GEMINI REST HELPER =================
 GEMINI_MODEL = "gemini-2.0-flash"
 
-def gemini_generate(prompt: str):
+def gemini_generate(prompt: str, media_data: bytes = None, mime_type: str = None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={gemini_api_key}"
+
+    # Base parts with text prompt
+    parts = [{"text": prompt}]
+
+    # If media (audio) is provided, append inline data
+    if media_data and mime_type:
+        b64_data = base64.b64encode(media_data).decode('utf-8')
+        parts.append({
+            "inline_data": {
+                "mime_type": mime_type,
+                "data": b64_data
+            }
+        })
 
     payload = {
         "contents": [
-            {"parts": [{"text": prompt}]}
+            {"parts": parts}
         ]
     }
 
@@ -392,8 +477,13 @@ def gemini_generate(prompt: str):
 
 
 # ================= GEMINI AI PARSER =================
-def parse_reminder_with_gemini(message: str, user: str):
+def parse_reminder_with_gemini(message: str, user: str, audio_bytes: bytes = None, mime_type: str = None):
     current_time = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+    # Adjust prompt based on input type
+    context_instruction = f"Message: '{message}'"
+    if audio_bytes:
+        context_instruction = "Input is an AUDIO file. Transcribe it exactly and extract the user's intent from the spoken words."
 
     prompt = f"""
 You are a reminder parsing assistant and a polite AI helper.
@@ -403,7 +493,7 @@ Your ONLY job is to return VALID JSON.
 Current datetime: {current_time.strftime("%Y-%m-%d %H:%M")}
 Timezone: Asia/Kolkata
 
-Message: "{message}"
+{context_instruction}
 
 Return JSON with exactly these keys:
 
@@ -426,6 +516,7 @@ Rules:
 - If saying show/list, use "list_reminders"
 - If cancelling a specific task, use "cancel_reminder"
 - If unsure, use "unknown"
+- Support recurrence: "every day" = daily, "weekly" = weekly, "every monday" = weekly
 - If no explicit time but clear date, choose reasonable default:
     morning = 09:00
     evening = 18:00
@@ -434,7 +525,7 @@ Rules:
 Return ONLY JSON.
 """
 
-    raw = gemini_generate(prompt)
+    raw = gemini_generate(prompt, media_data=audio_bytes, mime_type=mime_type)
 
     if not raw:
         return {
@@ -458,6 +549,7 @@ Return ONLY JSON.
         # defaults fallback
         result.setdefault("intent", "unknown")
         result.setdefault("confidence", 0)
+        result.setdefault("recurrence", "once")
 
         return result
 
@@ -468,16 +560,36 @@ Return ONLY JSON.
             "intent": "unknown",
             "objective": None,
             "datetime": None,
-            "recurrence": None,
+            "recurrence": "once",
             "priority": None,
             "cancel_target": None,
             "ai_reply": None,
             "confidence": 0
         }
 
+
+# ================= AUTO-DELETE MESSAGE =================
+async def delete_message_after_delay(event, delay_seconds=60):
+    """Delete both user and bot messages after delay"""
+    try:
+        await asyncio.sleep(delay_seconds)
+        
+        # Delete bot's response
+        await event.delete()
+        
+        # Delete user's message
+        user_msg = event.message.reply_to_msg_id
+        if user_msg:
+            await client.delete_messages(event.chat_id, [user_msg])
+        
+        logger.info(f"Auto-deleted unknown intent messages after {delay_seconds}s")
+    except Exception as e:
+        logger.error(f"Failed to auto-delete message: {e}")
+
+
 # ================= BOLNA API =================
 def trigger_call(user, objective, phone, schedule_iso):
-    url = "[https://api.bolna.ai/call](https://api.bolna.ai/call)"
+    url = "https://api.bolna.ai/call"
 
     payload = {
         "agent_id": "fa97b4d6-1a23-4a76-901f-23248d2de793",
@@ -503,7 +615,7 @@ def trigger_call(user, objective, phone, schedule_iso):
 
 
 def cancel_bolna_call(execution_id):
-    url = f"[https://api.bolna.ai/call/](https://api.bolna.ai/call/){execution_id}/stop"
+    url = f"https://api.bolna.ai/call/{execution_id}/stop"
     headers = {
         "Authorization": "Bearer bn-0e8607c5312643ffa50f22d80baba8e8",
         "Content-Type": "application/json"
@@ -515,6 +627,26 @@ def cancel_bolna_call(execution_id):
         return None
 
 
+# ================= BOLNA WEBHOOK =================
+@app.post("/webhook/bolna")
+async def bolna_webhook(payload: dict):
+    """Handle Bolna webhook for call completion"""
+    try:
+        execution_id = payload.get("execution_id")
+        status = payload.get("status")  # e.g., "completed", "failed"
+        
+        logger.info(f"Bolna webhook: execution_id={execution_id}, status={status}")
+        
+        if status == "completed":
+            # Reschedule if it's a recurring reminder
+            reschedule_recurring_reminder(execution_id)
+        
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 # ================= TELEGRAM LISTENER =================
 @app.get("/start-listening")
 async def start_listening():
@@ -522,6 +654,10 @@ async def start_listening():
 
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
+
+        # Only handle private messages
+        if not event.is_private:
+            return
 
         message_text = event.message.text or ""
         sender = await event.get_sender()
@@ -538,7 +674,7 @@ async def start_listening():
             state_type = conv_state['state']
             state_data = conv_state['data']
 
-            # Confirm cancel single reminder
+            # Confirm cancel single reminder (TEXT REPLY)
             if state_type == 'confirm_cancel':
                 user_response = message_text.lower().strip()
 
@@ -549,11 +685,23 @@ async def start_listening():
                     if reminder:
                         _, objective, execution_id, _, _, _, _, _ = reminder
 
+                        # —————————— UPDATED LOGIC START ——————————
+                        api_success = True
                         if execution_id:
-                            cancel_bolna_call(execution_id)
+                            response = cancel_bolna_call(execution_id)
+                            # Verify if API call was actually successful (status code 200)
+                            if not response or response.status_code != 200:
+                                api_success = False
+                                error_detail = response.text if response else "Unknown Error"
+                                logger.error(f"Bolna Cancel Failed: {error_detail}")
 
-                        delete_reminder(execution_id)
-                        await event.respond(f"✅ Cancelled: {objective}")
+                        if api_success:
+                            delete_reminder(execution_id)
+                            await event.respond(f"✅ Cancelled: {objective}")
+                        else:
+                            await event.respond("❌ Failed to cancel the call via API. Reminder kept in database.")
+                        # —————————— UPDATED LOGIC END ——————————
+
                     else:
                         await event.respond("❌ Reminder not found.")
 
@@ -621,8 +769,32 @@ async def start_listening():
                     await event.respond("Please send your phone number (91XXXXXXXXXX).")
                     return
 
-        # ——— PARSE MESSAGE WITH GEMINI ———
-        parsed = parse_reminder_with_gemini(message_text, display_name)
+        # ——— PARSE MESSAGE (TEXT OR AUDIO) WITH GEMINI ———
+        
+        # Determine if this is a voice/audio message
+        audio_data = None
+        mime_type = None
+
+        if event.message.media and (event.message.voice or event.message.audio):
+            try:
+                # Download audio to memory (bytes)
+                audio_data = await event.message.download_media(file=bytes)
+                # Telegram usually sends OGG/OPUS for voice notes
+                mime_type = event.message.file.mime_type or "audio/ogg"
+                await event.respond("🎤 Listening to your voice note...")
+            except Exception as e:
+                logger.error(f"Failed to download audio: {e}")
+                await event.respond("❌ Failed to process audio file.")
+                return
+
+        # Pass either text OR audio to Gemini
+        parsed = parse_reminder_with_gemini(
+            message_text, 
+            display_name, 
+            audio_bytes=audio_data, 
+            mime_type=mime_type
+        )
+        
         intent = parsed.get("intent")
 
         # HELP INTENT
@@ -631,9 +803,10 @@ async def start_listening():
                 "🤖 **I am your Call Reminder AI.**\n\n"
                 "Here is what I can do:\n"
                 "1️⃣ **Set a Call:** 'Remind me to call John at 5pm'\n"
-                "2️⃣ **List Tasks:** 'Show my reminders'\n"
-                "3️⃣ **Cancel:** 'Cancel the meeting reminder'\n"
-                "4️⃣ **Clear All:** 'Delete all reminders'"
+                "2️⃣ **Set Recurring:** 'Call mom every day at 9am'\n"
+                "3️⃣ **List Tasks:** 'Show my reminders'\n"
+                "4️⃣ **Cancel:** 'Cancel the meeting reminder'\n"
+                "5️⃣ **Clear All:** 'Delete all reminders'"
             )
             return
 
@@ -668,8 +841,8 @@ async def start_listening():
 
             reply = "📋 Upcoming reminders:\n\n"
             for i, (obj, sched, priority, recurrence) in enumerate(reminders, start=1):
-                recurrence_text = f" ({recurrence})" if recurrence else ""
-                reply += f"{i}) {obj}\n   {sched}{recurrence_text}\n\n"
+                recurrence_text = f" 🔁 ({recurrence})" if recurrence and recurrence != "once" else ""
+                reply += f"{i}) {obj}\n   ⏰ {sched}{recurrence_text}\n\n"
 
             await event.respond(reply)
             return
@@ -677,8 +850,11 @@ async def start_listening():
         # CANCEL SPECIFIC
         if intent == "cancel_reminder":
             target = parsed.get("cancel_target", message_text)
+            
+            # Use objective from parsing if available (for voice), else input text
+            search_text = parsed.get("objective") if audio_data else target
 
-            match = find_best_matching_reminder(display_name, target)
+            match = find_best_matching_reminder(display_name, search_text)
 
             if not match:
                 await event.respond("Could not find similar reminder. Try /list")
@@ -694,7 +870,7 @@ async def start_listening():
                 })
 
                 await event.respond(
-                    f"Cancel this?\n\n{objective}\n{sched}\n\nReply yes / no"
+                    f"Cancel this?\n\n{objective}\n⏰ {sched}\n\nReply yes / no"
                 )
                 return
 
@@ -711,9 +887,11 @@ async def start_listening():
         if intent == "create_reminder":
             objective = parsed.get("objective")
             dt_str = parsed.get("datetime")
+            recurrence = parsed.get("recurrence", "once")
+            priority = parsed.get("priority", "normal")
 
             if not objective or not dt_str:
-                await event.respond("Need task + time.")
+                await event.respond("Need task + time. Example: 'Call mom tomorrow at 5pm'")
                 return
 
             parsed_dt = dateparser.parse(
@@ -739,15 +917,39 @@ async def start_listening():
 
             result = trigger_call(display_name, objective, phone, scheduled_iso)
             execution_id = result.get("execution_id")
+            
+            if not execution_id:
+                await event.respond(f"❌ Failed to schedule: {result.get('message', 'Unknown error')}")
+                return
+            
             sched_str = parsed_dt.strftime("%Y-%m-%d %H:%M")
 
-            save_reminder(objective, execution_id, display_name, phone, sched_str)
+            save_reminder(
+                objective, 
+                execution_id, 
+                display_name, 
+                phone, 
+                sched_str,
+                recurrence_pattern=recurrence if recurrence != "once" else None,
+                priority=priority
+            )
 
-            await event.respond(f"Reminder set:\n{objective}\n⏰ {sched_str}")
+            recurrence_msg = f"\n🔁 Repeats: {recurrence}" if recurrence != "once" else ""
+            await event.respond(
+                f"✅ Reminder set!\n\n"
+                f"📝 {objective}\n"
+                f"⏰ {sched_str}{recurrence_msg}"
+            )
             return
 
-        # UNKNOWN
-        await event.respond("The thing you are asking is out of my context , I am a Call Reminder AI , I don't answer these")
+        # UNKNOWN - AUTO DELETE AFTER 1 MINUTE
+        response = await event.respond(
+            "⚠️ The thing you are asking is out of my context. I am a Call Reminder AI, I don't answer these questions.\n\n"
+            "ℹ️ This message will auto-delete in 1 minute."
+        )
+        
+        # Schedule auto-deletion
+        asyncio.create_task(delete_message_after_delay(response, delay_seconds=60))
 
     # ================= CALLBACK HANDLER =================
     @client.on(events.CallbackQuery())
@@ -759,6 +961,38 @@ async def start_listening():
         if data == "cancel_action":
             clear_conversation_state(username)
             await event.edit("Action cancelled.")
+            return
+        
+        # CANCEL SPECIFIC CONFIRMED (BUTTON)
+        if data.startswith("conf_rem_"):
+            try:
+                rem_id = int(data.split("_")[2])
+                reminder = get_reminder_by_id(rem_id)
+
+                if reminder:
+                    _, objective, execution_id, _, _, _, _, _ = reminder
+                    
+                    # —————————— UPDATED LOGIC START ——————————
+                    api_success = True
+                    if execution_id:
+                        response = cancel_bolna_call(execution_id)
+                        # Verify if API call was actually successful
+                        if not response or response.status_code != 200:
+                            api_success = False
+                            logger.error(f"Bolna Cancel Failed via Button")
+                    
+                    if api_success:
+                        delete_reminder(execution_id)
+                        clear_conversation_state(username)
+                        await event.edit(f"✅ Cancelled: {objective}")
+                    else:
+                        await event.edit("❌ Failed to cancel call via API. Reminder kept.")
+                    # —————————— UPDATED LOGIC END ——————————
+                else:
+                    await event.edit("❌ Reminder not found or already deleted.")
+            except Exception as e:
+                logger.error(f"Callback error: {e}")
+                await event.edit("❌ Error processing request.")
             return
 
     client.loop.create_task(client.run_until_disconnected())
