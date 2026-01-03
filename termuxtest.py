@@ -175,7 +175,7 @@ def save_reminder(objective, execution_id, user, phone, scheduled_at,
     c = conn.cursor()
     c.execute("""
         INSERT INTO reminders (objective, execution_id, user, phone, scheduled_at,
-                              created_at, recurrence_pattern, priority, status, notes)
+                               created_at, recurrence_pattern, priority, status, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
     """, (objective, execution_id, user, phone, scheduled_at,
           datetime.now().isoformat(), recurrence_pattern, priority, notes))
@@ -209,7 +209,7 @@ def delete_reminder(execution_id):
 
     c.execute("""
         INSERT INTO reminder_history (reminder_id, objective, user, scheduled_at,
-                                     triggered_at, status, notes)
+                                      triggered_at, status, notes)
         SELECT id, objective, user, scheduled_at, datetime('now'), 'cancelled', notes
         FROM reminders WHERE execution_id = ?
     """, (execution_id,))
@@ -225,7 +225,7 @@ def delete_all_user_reminders(user_identifier):
 
     c.execute("""
         INSERT INTO reminder_history (reminder_id, objective, user, scheduled_at,
-                                     triggered_at, status, notes)
+                                      triggered_at, status, notes)
         SELECT id, objective, user, scheduled_at, datetime('now'), 'cancelled', 'bulk cancel'
         FROM reminders WHERE (user = ? OR phone = ?) AND status = 'active'
     """, (user_identifier, user_identifier))
@@ -236,6 +236,8 @@ def delete_all_user_reminders(user_identifier):
     """, (user_identifier, user_identifier))
     conn.commit()
     conn.close()
+
+
 # ================= FETCH REMINDERS =================
 def fetch_user_reminders_with_ids(user_identifier):
     conn = sqlite3.connect(DB_PATH)
@@ -394,7 +396,7 @@ def parse_reminder_with_gemini(message: str, user: str):
     current_time = datetime.now(ZoneInfo("Asia/Kolkata"))
 
     prompt = f"""
-You are a reminder parsing assistant.
+You are a reminder parsing assistant and a polite AI helper.
 
 Your ONLY job is to return VALID JSON.
 
@@ -405,15 +407,20 @@ Message: "{message}"
 
 Return JSON with exactly these keys:
 
-  "intent": one of ["create_reminder","cancel_reminder","cancel_all","list_reminders","unknown"]
+  "intent": one of ["create_reminder","cancel_reminder","cancel_all","list_reminders","greeting","help","unknown"]
   "objective": string or null
   "datetime": string (YYYY-MM-DD HH:MM) or null
   "recurrence": one of ["once","daily","weekly","monthly","yearly"] or null
   "priority": one of ["low","normal","high","urgent"] or null
   "cancel_target": string or null
+  "ai_reply": string or null
   "confidence": number 0–1
 
 Rules:
+- If user says "hi", "hello", "how are you", "weather", or makes small talk, intent = "greeting".
+    - Populate "ai_reply" with a polite, short response.
+    - Be friendly but remind them you are a "Call Reminder AI" and don't track weather/news but can schedule calls.
+- If user says "help", "options", "commands", "menu" or ambiguous 1-2 words like "what do", intent = "help".
 - If user is clearly creating reminder, intent = "create_reminder"
 - If saying cancel all reminders, use "cancel_all"
 - If saying show/list, use "list_reminders"
@@ -437,6 +444,7 @@ Return ONLY JSON.
             "recurrence": None,
             "priority": None,
             "cancel_target": None,
+            "ai_reply": None,
             "confidence": 0
         }
 
@@ -463,12 +471,13 @@ Return ONLY JSON.
             "recurrence": None,
             "priority": None,
             "cancel_target": None,
+            "ai_reply": None,
             "confidence": 0
         }
 
 # ================= BOLNA API =================
 def trigger_call(user, objective, phone, schedule_iso):
-    url = "https://api.bolna.ai/call"
+    url = "[https://api.bolna.ai/call](https://api.bolna.ai/call)"
 
     payload = {
         "agent_id": "fa97b4d6-1a23-4a76-901f-23248d2de793",
@@ -494,7 +503,7 @@ def trigger_call(user, objective, phone, schedule_iso):
 
 
 def cancel_bolna_call(execution_id):
-    url = f"https://api.bolna.ai/call/{execution_id}/stop"
+    url = f"[https://api.bolna.ai/call/](https://api.bolna.ai/call/){execution_id}/stop"
     headers = {
         "Authorization": "Bearer bn-0e8607c5312643ffa50f22d80baba8e8",
         "Content-Type": "application/json"
@@ -504,6 +513,8 @@ def cancel_bolna_call(execution_id):
     except Exception as e:
         logger.error(f"Bolna cancel error: {e}")
         return None
+
+
 # ================= TELEGRAM LISTENER =================
 @app.get("/start-listening")
 async def start_listening():
@@ -614,6 +625,24 @@ async def start_listening():
         parsed = parse_reminder_with_gemini(message_text, display_name)
         intent = parsed.get("intent")
 
+        # HELP INTENT
+        if intent == "help":
+            await event.respond(
+                "🤖 **I am your Call Reminder AI.**\n\n"
+                "Here is what I can do:\n"
+                "1️⃣ **Set a Call:** 'Remind me to call John at 5pm'\n"
+                "2️⃣ **List Tasks:** 'Show my reminders'\n"
+                "3️⃣ **Cancel:** 'Cancel the meeting reminder'\n"
+                "4️⃣ **Clear All:** 'Delete all reminders'"
+            )
+            return
+
+        # GREETING INTENT
+        if intent == "greeting":
+            reply = parsed.get("ai_reply") or "Hello! I am ready to schedule your calls."
+            await event.respond(reply)
+            return
+
         # CANCEL ALL
         if intent == "cancel_all":
             reminders = fetch_user_reminders_with_ids(display_name)
@@ -718,7 +747,7 @@ async def start_listening():
             return
 
         # UNKNOWN
-        await event.respond("I am a Call Reminder AI , I can't help you with that , to know what i can do send commands keyword")
+        await event.respond("I did not understand. Try:\n'remind me to drink water at 3pm'")
 
     # ================= CALLBACK HANDLER =================
     @client.on(events.CallbackQuery())
