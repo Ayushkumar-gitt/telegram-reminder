@@ -390,28 +390,41 @@ def gemini_generate(prompt: str):
 
 
 # ================= GEMINI AI PARSER =================
-def parse_reminder_with_gemini(message: str, user: str) -> Dict:
+def parse_reminder_with_gemini(message: str, user: str):
     current_time = datetime.now(ZoneInfo("Asia/Kolkata"))
 
     prompt = f"""
 You are a reminder parsing assistant.
 
-Current datetime: {current_time.strftime("%Y-%m-%d %H:%M %A")}
+Your ONLY job is to return VALID JSON.
+
+Current datetime: {current_time.strftime("%Y-%m-%d %H:%M")}
 Timezone: Asia/Kolkata
 
 Message: "{message}"
 
-Return ONLY JSON (no explanation):
+Return JSON with exactly these keys:
 
-{{
- "intent": "...",
- "objective": "...",
- "datetime": "...",
- "recurrence": "...",
- "priority": "...",
- "cancel_target": "...",
- "confidence": 0-1
-}}
+  "intent": one of ["create_reminder","cancel_reminder","cancel_all","list_reminders","unknown"]
+  "objective": string or null
+  "datetime": string (YYYY-MM-DD HH:MM) or null
+  "recurrence": one of ["once","daily","weekly","monthly","yearly"] or null
+  "priority": one of ["low","normal","high","urgent"] or null
+  "cancel_target": string or null
+  "confidence": number 0–1
+
+Rules:
+- If user is clearly creating reminder, intent = "create_reminder"
+- If saying cancel all reminders, use "cancel_all"
+- If saying show/list, use "list_reminders"
+- If cancelling a specific task, use "cancel_reminder"
+- If unsure, use "unknown"
+- If no explicit time but clear date, choose reasonable default:
+    morning = 09:00
+    evening = 18:00
+- If time is past, move to next day automatically
+- Do NOT use markdown or ``` in the response.
+Return ONLY JSON.
 """
 
     raw = gemini_generate(prompt)
@@ -428,11 +441,21 @@ Return ONLY JSON (no explanation):
         }
 
     try:
-        raw = re.sub(r'^```json|```$', '', raw).strip()
-        return json.loads(raw)
+        # remove accidental code formatting
+        raw = raw.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+
+        result = json.loads(raw)
+
+        # defaults fallback
+        result.setdefault("intent", "unknown")
+        result.setdefault("confidence", 0)
+
+        return result
 
     except Exception as e:
-        logger.error(f"Gemini parse error: {e}")
+        logger.error(f"GEMINI JSON PARSE ERROR: {e}\nRAW: {raw}")
+
         return {
             "intent": "unknown",
             "objective": None,
@@ -442,7 +465,6 @@ Return ONLY JSON (no explanation):
             "cancel_target": None,
             "confidence": 0
         }
-
 
 # ================= BOLNA API =================
 def trigger_call(user, objective, phone, schedule_iso):
