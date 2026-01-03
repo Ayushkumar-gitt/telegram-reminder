@@ -718,7 +718,7 @@ async def start_listening():
             return
 
         # UNKNOWN
-        await event.respond("I did not understand. Try:\n'remind me to drink water at 3pm'")
+        await event.respond("I am a Call Reminder AI , I can't help you with that , to know what i can do send commands keyword")
 
     # ================= CALLBACK HANDLER =================
     @client.on(events.CallbackQuery())
